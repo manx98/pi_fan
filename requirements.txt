@@ -1,0 +1,7 @@
+pillow 
+luma.core 
+luma.oled 
+psutil 
+ipython 
+smbus2 
+pigpio

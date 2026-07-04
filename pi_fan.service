@@ -1,0 +1,18 @@
+[Unit]
+Description=OLED CPU Monitor and GPIO12 PWM Fan Control
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory={SRC_DIR}
+ExecStart=bash run.sh
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
