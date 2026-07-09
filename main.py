@@ -334,7 +334,11 @@ class DirectRegisterThresholdPWMFan:
             self.CLK_PWMCTL,
             self.BCM_PASSWORD | self.CLK_CTL_ENAB | self.CLK_CTL_SRC_PLLD,
         )
-        self._sleep_short()
+        for _ in range(1000):
+            if self.clk_regs.read32(self.CLK_PWMCTL) & self.CLK_CTL_BUSY:
+                return
+            time.sleep(0.001)
+        raise RuntimeError("等待 PWM clock 启动超时")
 
     def _channel_ctl_bits(self):
         if self.pwm_channel == 0:
@@ -373,11 +377,11 @@ class DirectRegisterThresholdPWMFan:
 
     def _write_pwm(self, output_duty):
         output_duty = clamp_duty(output_duty)
+        data = self._duty_to_data(output_duty)
+        self.pwm_regs.write32(self._data_offset(), data)
         if output_duty == self.last_output_duty:
             return output_duty
 
-        data = self._duty_to_data(output_duty)
-        self.pwm_regs.write32(self._data_offset(), data)
         self.last_output_duty = output_duty
         print(f"fan output duty set to {output_duty}% ({data}/{self.pwm_range})")
         return output_duty
