@@ -27,7 +27,7 @@ MAX_TEMP = 50
 
 # 4 线 PWM 风扇常用 25kHz
 PWM_FREQ = 25_000
-PWM_RANGE = 1000
+PWM_CLOCK_DIVIDER = 2
 
 # 用户设定的固定转速，占空比 0~100
 DEFAULT_FAN_DUTY = 60
@@ -86,12 +86,6 @@ def parse_args():
         type=int,
         default=None,
         help="硬件 PWM GPIO，默认 GPIO12。支持 GPIO12/13/18/19。"
-    )
-    parser.add_argument(
-        "--pwm-range",
-        type=int,
-        default=None,
-        help="PWM range，默认 1000。占空比会映射到 0~range。"
     )
     return parser.parse_args()
 
@@ -182,6 +176,7 @@ class DirectRegisterThresholdPWMFan:
     PWM_CTL_MSEN1 = 1 << 7
     PWM_CTL_PWEN2 = 1 << 8
     PWM_CTL_MSEN2 = 1 << 15
+    PWM_CTL_CHANNEL_MASK = PWM_CTL_PWEN1 | PWM_CTL_MSEN1 | PWM_CTL_PWEN2 | PWM_CTL_MSEN2
 
     CLK_PWMCTL = 0xA0
     CLK_PWMDIV = 0xA4
@@ -199,7 +194,7 @@ class DirectRegisterThresholdPWMFan:
         19: (1, 2),  # GPIO19 ALT5 -> PWM1
     }
 
-    def __init__(self, gpio, freq, pwm_range, fixed_duty, min_temp, max_temp):
+    def __init__(self, gpio, freq, fixed_duty, min_temp, max_temp):
         if min_temp >= max_temp:
             raise ValueError(f"MIN_TEMP 必须小于 MAX_TEMP，当前 MIN_TEMP={min_temp}, MAX_TEMP={max_temp}")
 
@@ -209,12 +204,8 @@ class DirectRegisterThresholdPWMFan:
         if int(freq) <= 0:
             raise ValueError("PWM_FREQ 必须大于 0")
 
-        if int(pwm_range) <= 0:
-            raise ValueError("PWM_RANGE 必须大于 0")
-
         self.gpio = int(gpio)
         self.freq = int(freq)
-        self.pwm_range = int(pwm_range)
         self.pwm_channel, self.gpio_alt = self.GPIO_PWM_MAP[self.gpio]
         self.fixed_duty = clamp_duty(fixed_duty)
         self.min_temp = float(min_temp)
@@ -228,10 +219,11 @@ class DirectRegisterThresholdPWMFan:
 
         self.peripheral_base = self._detect_peripheral_base()
         self.plld_freq = self._detect_plld_frequency()
-        self.clock_divider = self.plld_freq / (self.freq * self.pwm_range)
-        if self.clock_divider < 1.0 or self.clock_divider >= 4096.0:
+        self.real_range = int(round(self.plld_freq / (PWM_CLOCK_DIVIDER * self.freq)))
+        self.clock_divider = PWM_CLOCK_DIVIDER
+        if self.real_range <= 0:
             raise RuntimeError(
-                f"无法生成 {self.freq}Hz PWM：PLLD={self.plld_freq}, range={self.pwm_range}, divider={self.clock_divider:.4f}"
+                f"无法生成 {self.freq}Hz PWM：PLLD={self.plld_freq}, divider={self.clock_divider}"
             )
 
         try:
@@ -263,7 +255,7 @@ class DirectRegisterThresholdPWMFan:
             )
             self.mode = (
                 f"direct register PWM GPIO{self.gpio} PWM{self.pwm_channel} "
-                f"{self.freq}Hz range={self.pwm_range} base=0x{self.peripheral_base:X}"
+                f"{self.freq}Hz range={self.real_range} base=0x{self.peripheral_base:X}"
             )
             self._init_pwm_output()
         except Exception:
@@ -313,21 +305,15 @@ class DirectRegisterThresholdPWMFan:
         self._sleep_short()
 
     def _stop_pwm_clock(self):
-        self.clk_regs.write32(self.CLK_PWMCTL, self.BCM_PASSWORD | self.CLK_CTL_KILL)
         for _ in range(1000):
+            self.clk_regs.write32(self.CLK_PWMCTL, self.BCM_PASSWORD | self.CLK_CTL_KILL)
             if not (self.clk_regs.read32(self.CLK_PWMCTL) & self.CLK_CTL_BUSY):
                 return
             time.sleep(0.001)
         raise RuntimeError("等待 PWM clock 停止超时")
 
     def _start_pwm_clock(self):
-        divi = int(self.clock_divider)
-        divf = int(round((self.clock_divider - divi) * 4096))
-        if divf >= 4096:
-            divi += 1
-            divf = 0
-
-        self.clk_regs.write32(self.CLK_PWMDIV, self.BCM_PASSWORD | (divi << 12) | divf)
+        self.clk_regs.write32(self.CLK_PWMDIV, self.BCM_PASSWORD | (self.clock_divider << 12))
         self.clk_regs.write32(self.CLK_PWMCTL, self.BCM_PASSWORD | self.CLK_CTL_SRC_PLLD)
         self._sleep_short()
         self.clk_regs.write32(
@@ -339,6 +325,20 @@ class DirectRegisterThresholdPWMFan:
                 return
             time.sleep(0.001)
         raise RuntimeError("等待 PWM clock 启动超时")
+
+    def _ensure_pwm_clock(self):
+        ctl = self.clk_regs.read32(self.CLK_PWMCTL)
+        div = self.clk_regs.read32(self.CLK_PWMDIV)
+        expected_div = self.clock_divider << 12
+        if (ctl & (self.CLK_CTL_BUSY | self.CLK_CTL_ENAB | 0xF)) == (
+            self.CLK_CTL_BUSY | self.CLK_CTL_ENAB | self.CLK_CTL_SRC_PLLD
+        ) and (div & 0xFFFFFF) == expected_div:
+            return
+
+        self.pwm_regs.write32(self.PWM_CTL, 0)
+        self._sleep_short()
+        self._stop_pwm_clock()
+        self._start_pwm_clock()
 
     def _channel_ctl_bits(self):
         if self.pwm_channel == 0:
@@ -353,7 +353,7 @@ class DirectRegisterThresholdPWMFan:
 
     def _duty_to_data(self, duty):
         duty = clamp_duty(duty)
-        return int(round(self.pwm_range * duty / 100.0))
+        return int(round(self.real_range * duty / 100.0))
 
     def _init_pwm_output(self):
         self._set_gpio_alt()
@@ -363,27 +363,36 @@ class DirectRegisterThresholdPWMFan:
         self._stop_pwm_clock()
         self._start_pwm_clock()
 
-        self.pwm_regs.write32(self._range_offset(), self.pwm_range)
+        self.pwm_regs.write32(self._range_offset(), self.real_range)
         self.pwm_regs.write32(self._data_offset(), 0)
         self._sleep_short()
         self.pwm_regs.write32(self.PWM_CTL, self._channel_ctl_bits())
 
         self.last_output_duty = 0.0
-        actual_freq = self.plld_freq / (self.clock_divider * self.pwm_range)
+        actual_freq = self.plld_freq / (self.clock_divider * self.real_range)
         print(
             f"fan PWM initialized: GPIO{self.gpio}, channel={self.pwm_channel}, "
-            f"freq={actual_freq:.2f}Hz, range={self.pwm_range}, divider={self.clock_divider:.4f}"
+            f"freq={actual_freq:.2f}Hz, range={self.real_range}, divider={self.clock_divider:.4f}"
         )
 
     def _write_pwm(self, output_duty):
         output_duty = clamp_duty(output_duty)
         data = self._duty_to_data(output_duty)
+
+        self._ensure_pwm_clock()
+        self._set_gpio_alt()
+        self.pwm_regs.write32(self._range_offset(), self.real_range)
+        self._sleep_short()
         self.pwm_regs.write32(self._data_offset(), data)
+        self._sleep_short()
+        old_ctl = self.pwm_regs.read32(self.PWM_CTL) & self.PWM_CTL_CHANNEL_MASK
+        self.pwm_regs.write32(self.PWM_CTL, old_ctl | self._channel_ctl_bits())
+
         if output_duty == self.last_output_duty:
             return output_duty
 
         self.last_output_duty = output_duty
-        print(f"fan output duty set to {output_duty}% ({data}/{self.pwm_range})")
+        print(f"fan output duty set to {output_duty}% ({data}/{self.real_range})")
         return output_duty
 
     def set_fixed_duty(self, duty):
@@ -552,12 +561,10 @@ if __name__ == "__main__":
     max_temp = get_float_config(args.max_temp, "MAX_TEMP", MAX_TEMP)
     initial_duty = get_initial_duty(args)
     pwm_gpio = get_int_config(args.pwm_gpio, "PWM_GPIO", TEMP_CHANNEL)
-    pwm_range = get_int_config(args.pwm_range, "PWM_RANGE", PWM_RANGE)
 
     fan = DirectRegisterThresholdPWMFan(
         gpio=pwm_gpio,
         freq=PWM_FREQ,
-        pwm_range=pwm_range,
         fixed_duty=initial_duty,
         min_temp=min_temp,
         max_temp=max_temp,
@@ -571,7 +578,7 @@ if __name__ == "__main__":
     print("fan max temp:", max_temp)
     print("fan duty control file:", CONTROL_FILE)
     print("fan pwm gpio:", pwm_gpio)
-    print("fan pwm range:", pwm_range)
+    print("fan pwm real range:", fan.real_range)
 
     def handle_stop(signum, frame):
         raise KeyboardInterrupt

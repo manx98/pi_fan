@@ -1,5 +1,5 @@
 #!/bin/bash
-SRC_DIR=$(dirname $0)
+SRC_DIR=$(dirname "$0")
 cd "$SRC_DIR"
 SRC_DIR=$(pwd)
 rm -rf venv
@@ -22,7 +22,7 @@ then
 fi
 cp pi_fan.service /etc/systemd/system
 SRC_DIR_ESCAPED=$(printf '%s\n' "$SRC_DIR" | sed 's/[&]/\\&/g')
-chmod +x /etc/systemd/system/pi_fan.service
 sed -i "s|{SRC_DIR}|${SRC_DIR_ESCAPED}|g" /etc/systemd/system/pi_fan.service
+systemctl daemon-reload
 systemctl enable pi_fan.service
-systemctl start pi_fan.service
+systemctl restart pi_fan.service
